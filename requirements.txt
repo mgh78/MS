@@ -3,4 +3,6 @@ langchain
 langchain-community
 langchain-ollama
 qdrant-client
+langgraph
+langchain-tavily
 
