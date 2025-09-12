@@ -1,6 +1,6 @@
 import argparse
 from typing import List
-from functools import lru_cache
+from functools import lru_cache # memory cache for caching the embeddings and chat models
 
 from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -14,7 +14,8 @@ client = QdrantClient(url="http://localhost:6333")
 
 @lru_cache(maxsize=1)
 def get_embeddings_model() -> OllamaEmbeddings:
-    return OllamaEmbeddings(model="nomic-embed-text")
+    # Multilingual embeddings for Persian/English
+    return OllamaEmbeddings(model="bge-m3")
 
 
 @lru_cache(maxsize=256)
@@ -24,21 +25,29 @@ def embed_text_cached(text: str) -> List[float]:
 
 @lru_cache(maxsize=2)
 def get_chat_model(name: str) -> ChatOllama:
-    return ChatOllama(model=name)
+    # Fast defaults: lower max tokens and stable temperature
+    return ChatOllama(model=name, temperature=0.3, num_predict=384)
 
-# Use wellness.txt which we already extracted from the PDF
+
+# Path to your extracted text file
 file_path = "/Users/mahdi/Desktop/RAG_MS/wellness.txt"
 loader = TextLoader(file_path, encoding="utf-8")
 
 
 def split_documents(documents: List[Document]) -> List[Document]:
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+    # Updated chunking: smaller chunks for better hit rate
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=400,
+        chunk_overlap=80,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
     return text_splitter.split_documents(documents)
 
 
 def build_collection(collection_name: str = "collection_ms") -> None:
     docs = loader.load()
     chunks = split_documents(docs)
+
     # Infer embedding dimension dynamically
     sample_vector = embed_text_cached(chunks[0].page_content if chunks else "sample")
     dim = len(sample_vector)
@@ -46,7 +55,6 @@ def build_collection(collection_name: str = "collection_ms") -> None:
     # Create or recreate collection with correct vector size
     try:
         client.get_collection(collection_name=collection_name)
-        # If exists, ensure dimensions match by recreating
         client.recreate_collection(
             collection_name=collection_name,
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
@@ -61,7 +69,14 @@ def build_collection(collection_name: str = "collection_ms") -> None:
     for i, d in enumerate(chunks):
         vec = embed_text_cached(d.page_content)
         points.append(
-            PointStruct(id=i, vector=vec, payload={"text": d.page_content})
+            PointStruct(
+                id=i,
+                vector=vec,
+                payload={
+                    "text": d.page_content,
+                    "chunk_id": i,
+                },
+            )
         )
 
     client.upsert(collection_name=collection_name, points=points)
@@ -104,9 +119,9 @@ def search(query: str, collection_name: str = "collection_ms", top_k: int = 3):
 def answer_question(
     question: str,
     collection_name: str = "collection_ms",
-    top_k: int = 3,
-    threshold: float = 0.3,
-    model: str = "llama3",
+    top_k: int = 2,
+    threshold: float = 0.6,
+    model: str = "qwen2.5:7b-instruct-q4_0",
 ) -> str:
     scored = search(question, collection_name=collection_name, top_k=top_k)
     if not scored:
@@ -117,10 +132,14 @@ def answer_question(
         return "I don't know."
 
     context = "\n\n".join(chunk for chunk, _ in scored)
+    # Cap context length to keep prompts fast
+    if len(context) > 4000:
+        context = context[:4000]
 
     prompt = (
-        "You are a helpful assistant. Use ONLY the context to answer.\n"
-        "If the answer is not clearly contained in the context, say: I don't know.\n\n"
+        "You are a helpful assistant. Answer in the same language as the question "
+        "(prefer Persian if the question is Persian). "
+        "Use ONLY the context to answer. If the answer is not clearly contained in the context, say: I don't know.\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n"
         "Answer:"
@@ -147,12 +166,7 @@ def main() -> None:
         default=0.6,
         help="Cosine similarity threshold for answering (higher = more precise, more 'I don't know')",
     )
-    parser.add_argument(
-        "--show_scores",
-        action="store_true",
-        help="When used with --ask, prints the retrieved chunk scores to help tune threshold",
-    )
-    parser.add_argument("--llm", type=str, default="llama3", help="Ollama chat model for answering")
+    parser.add_argument("--llm", type=str, default="qwen2.5:7b-instruct", help="Ollama chat model for answering")
     args = parser.parse_args()
 
     if args.build:

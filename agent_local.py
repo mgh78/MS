@@ -1,5 +1,6 @@
 from functools import lru_cache
 from typing import Dict, List, Any
+import os
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
@@ -35,15 +36,17 @@ def smart_answer(question: str) -> str:
 
     print("🌐 RAG failed, trying web search...")
     # Fallback: Web search via Tavily
-    tavily = TavilySearch(max_results=3)
+    api_key = os.getenv("TAVILY_API_KEY", "").strip()
+    tool_tavily = TavilySearch(max_results=2, api_key=api_key) if api_key else None
     try:
-        results = tavily.invoke(question) or []
+        if not tool_tavily:
+            raise RuntimeError("Tavily API key not configured")
+        results = tool_tavily.invoke(question) or []
         print(f"🔍 Web search results: {len(results)} items")
     except Exception as e:
         print(f"❌ Web search failed: {e}")
         # Provide a helpful hint if API key is missing
-        import os
-        if not os.getenv("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"):
+        if not api_key:
             return "I don't know. (Enable web search by setting TAVILY_API_KEY)"
         results = []
 
@@ -80,7 +83,7 @@ def smart_answer(question: str) -> str:
         f"Snippets:\n{context}\n\n"
         f"Question: {question}\nAnswer:"
     )
-    chat = ChatOllama(model="llama3")
+    chat = ChatOllama(model="qwen2.5:7b-instruct-q4_0", temperature=0.3, num_predict=384)
     try:
         resp = chat.invoke(prompt)
         text = getattr(resp, "content", "").strip()
@@ -91,10 +94,53 @@ def smart_answer(question: str) -> str:
         return "I don't know."
 
 
+def web_answer(question: str) -> str:
+    """Answer using ONLY web search (no local vector DB)."""
+    print(f"🌐 Web-only answer called with: {question}")
+    api_key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        return "I don't know. (Enable web search by setting TAVILY_API_KEY)"
+
+    search_tool = TavilySearch(max_results=3, api_key=api_key)
+    try:
+        results = search_tool.invoke(question) or []
+    except Exception as e:
+        print(f"❌ Tavily error: {e}")
+        return "I don't know."
+
+    items = results.get("results", results) if isinstance(results, dict) else results
+    snippets: List[str] = []
+    for item in items or []:
+        text = item.get("content") if isinstance(item, dict) else (item or "")
+        if not text:
+            text = item.get("snippet", "") if isinstance(item, dict) else ""
+        text = str(text).strip()
+        if len(text) > 10:
+            snippets.append(text)
+
+    if not snippets:
+        return "I don't know."
+
+    context = "\n\n".join(snippets[:3])
+    prompt = (
+        "You are a helpful assistant. Use ONLY the web snippets to answer briefly.\n"
+        "If the answer is not clearly contained in the snippets, say: I don't know.\n\n"
+        f"Snippets:\n{context}\n\n"
+        f"Question: {question}\nAnswer:"
+    )
+    chat = ChatOllama(model="qwen2.5:7b-instruct")
+    try:
+        resp = chat.invoke(prompt)
+        return getattr(resp, "content", "").strip() or "I don't know."
+    except Exception as e:
+        print(f"❌ LLM failed: {e}")
+        return "I don't know."
+
+
 @lru_cache(maxsize=1)
 def get_agent():
     memory = MemorySaver()
-    model = ChatOllama(model="llama3")
+    model = ChatOllama(model="qwen2.5:7b-instruct-q4_0", temperature=0.3, num_predict=384)
     tools = [smart_answer]
     agent = create_react_agent(model, tools, checkpointer=memory)
     return agent
