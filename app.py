@@ -4,6 +4,7 @@ from flask import Flask, render_template, request, jsonify, Response
 # Reuse the existing RAG pipeline from agent1.py
 from agent1 import answer_question, get_embeddings_model, get_chat_model, search
 from agent_local import invoke_agent_with_question
+from agent2 import answer_question as pinecone_answer_question, get_embeddings_model as pinecone_get_embeddings_model, get_chat_model as pinecone_get_chat_model
 
 
 def create_app() -> Flask:
@@ -18,6 +19,9 @@ def create_app() -> Flask:
     try:
         get_embeddings_model()
         get_chat_model(default_llm)
+        # Also prewarm Pinecone models
+        pinecone_get_embeddings_model()
+        pinecone_get_chat_model(default_llm)
     except Exception:
         # Prewarm failures should not crash the server
         pass
@@ -25,6 +29,10 @@ def create_app() -> Flask:
     @app.get("/")
     def index():
         return render_template("index.html")
+    
+    @app.get("/pinecone")
+    def pinecone_index():
+        return render_template("pinecone.html")
 
     # Pure RAG endpoint
     @app.post("/api/rag")
@@ -183,6 +191,29 @@ def create_app() -> Flask:
                 yield "I don't know."
 
         return Response(generate(), mimetype="text/plain")
+
+    # Pinecone RAG endpoint
+    @app.post("/api/pinecone")
+    def ask_pinecone():
+        data = request.get_json(silent=True) or {}
+        question = (data.get("question") or "").strip()
+        if not question:
+            return jsonify({"error": "question is required"}), 400
+
+        # Allow optional overrides per request
+        top_k = int(data.get("top_k") or 2)
+        threshold = float(data.get("threshold") or 0.6)
+        llm = data.get("llm") or default_llm
+        namespace = data.get("namespace") or "wellness-v1"
+
+        answer = pinecone_answer_question(
+            question,
+            top_k=top_k,
+            threshold=threshold,
+            model=llm,
+            namespace=namespace,
+        )
+        return jsonify({"answer": answer})
 
     return app
 
